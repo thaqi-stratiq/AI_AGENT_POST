@@ -22,7 +22,7 @@ INDUSTRIES = [
 ]
 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-3-flash-preview",
+    model="gemini-2.5-flash-lite",
     temperature=0,
     google_api_key=os.getenv("GOOGLE_API_KEY"),
     max_output_tokens=1024,
