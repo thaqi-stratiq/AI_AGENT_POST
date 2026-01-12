@@ -10,281 +10,290 @@ MODEL = "qwen2.5:0.5b-instruct"
 API_URL = "https://pzvpngd6ij.execute-api.ap-southeast-5.amazonaws.com/dev/create"
 #API_URL = "http://127.0.0.1:8000/receive"
 
+INDUSTRIES = [
+    "Aerospace",
+    "Education & Training",
+    "Medical Devices",
+    "Smart Buildings-Cities",
+    "Energy Technology",
+    "Robotics and Automation",
+    "Urban Air Mobility (UAM)",
+]
+
 llm = ChatOllama(model=MODEL)
+SYSTEM_EXTRACTOR = """
+You are a STRICT JSON assistant for an intake flow.
 
-INTENT_SYSTEM = """
-You are a routing assistant. Decide what the user wants.
-
-Return ONLY valid JSON with exactly this key:
-{"intent": "info" | "create_instance" | "other"}
-
-Rules:
-- intent="info" if the user is asking to explain Odoo/ERP or general "what is/how does" questions.
-- intent="create_instance" ONLY if the user clearly wants to create/spawn/start/setup an Odoo simulator instance (or says equivalent).
-- otherwise "other".
-Do NOT add extra keys. Do NOT wrap in markdown.
-"""
-
-INTAKE_SYSTEM = """
-You are an information extraction assistant.
-
-Extract the following fields from the user's message IF present:
-- company_name: string
-- company_background: string (short summary of what they do)
-- customer_name: string (who to create the simulator instance for)
-
-Return ONLY valid JSON with exactly these keys:
+Input JSON:
 {
-  "company_name": "",
-  "company_background": "",
-  "customer_name": ""
+  "expected_field": "company_name" | "company_background" | "industry_pick" | "customer_name",
+  "user_message": "..."
 }
 
+Decide mode:
+- mode="qa" if user_message is a general question (e.g., "what is odoo", "how ERP works").
+- mode="intake" if user_message attempts to answer expected_field.
+
+QA mode:
+- Put the helpful answer (2–6 sentences) in "answer".
+- Set "value" = "".
+
+Intake mode:
+- Extract ONLY the expected_field into "value".
+- If user did not clearly provide the expected_field, set "value" = "".
+
+Special:
+- expected_field="industry_pick": normalize partial inputs to one of the allowed industry labels ONLY if clearly intended,
+  otherwise value="".
+
+Return ONLY valid JSON with EXACTLY these keys:
+{
+  "mode": "qa" | "intake",
+  "answer": "",
+  "value": ""
+}
+No extra keys. No markdown. No text outside JSON.
+"""
+
+
+SYSTEM_INDUSTRY = f"""
+You are a STRICT industry classifier.
+
+Choose EXACTLY ONE industry from this list:
+{INDUSTRIES}
+
+Input: company_background (text)
+
 Rules:
-- If a field is not present, keep it empty string.
-- Do NOT add extra keys.
-- Do NOT wrap in markdown.
+- Always return exactly one industry from the list (never empty).
+- Choose the best match even if the background is short.
+- Return ONLY valid JSON with EXACTLY this key:
+{{"industry_name": ""}}
+No extra keys. No markdown. No text outside JSON.
 """
 
-HELP_SYSTEM = """
-You are a helpful assistant.
-Explain clearly, concisely, and conversationally.
-If the user asks about Odoo, explain what it is, what it’s used for, and give a short example.
-If relevant, you may add one gentle suggestion that you can create an Odoo simulator instance if they want.
-"""
 
-def safe_json_extract(text: str) -> dict:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1:
-        text = text[start:end + 1]
-    return json.loads(text)
-
-
-def detect_intent(user_text: str) -> str:
-    resp = llm.invoke([
-        ("system", INTENT_SYSTEM),
-        ("human", user_text),
-    ]).content.strip()
-    data = safe_json_extract(resp)
-    intent = (data.get("intent") or "other").strip()
-    return intent if intent in {"info", "create_instance", "other"} else "other"
-
-
-def extract_intake(user_text: str) -> Dict[str, str]:
-    resp = llm.invoke([
-        ("system", INTAKE_SYSTEM),
-        ("human", user_text),
-    ]).content.strip()
-    data = safe_json_extract(resp)
-    return {
-        "company_name": (data.get("company_name") or "").strip(),
-        "company_background": (data.get("company_background") or "").strip(),
-        "customer_name": (data.get("customer_name") or "").strip(),
+def on_submit(user_input, messages, state):
+    messages = messages or []
+    state = state or {
+        "step": "ask_company_name",
+        "company_name": "",
+        "company_background": "",
+        "industry_name": "",
+        "industry_confirmed": False,
+        "customer_name": "",
+        "created": False,
     }
 
-def merge_intake(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
-    merged = dict(old or {"company_name": "", "company_background": "", "customer_name": ""})
-    for k in ["company_name", "company_background", "customer_name"]:
-        if new.get(k):
-            merged[k] = new[k]
-    return merged
-
-
-def next_question(intake: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    Returns: (question_text, awaiting_field)
-    awaiting_field is used to deterministically capture short answers like "talysqi".
-    """
-    if not intake.get("company_name"):
-        return "Sure. What’s your company name?", "company_name"
-    if not intake.get("company_background"):
-        return "Nice. What does your company do (1–2 sentences)?", "company_background"
-    if not intake.get("customer_name"):
-        return "Great. Who should I create the Odoo simulator instance for? (customer name)", "customer_name"
-    return "", ""
-
-
-def send_customer_name(customer_name: str):
-    payload = {"customer_name": customer_name}  # only pass customer_name
-    r = requests.post(
-        API_URL,
-        json=payload,
-        headers={"Content-Type": "application/json"},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
-
-
-def llm_help_reply(user_text: str) -> str:
-    return llm.invoke([
-        ("system", HELP_SYSTEM),
-        ("human", user_text),
-    ]).content
-
-
-def llm_chat_reply(messages: List[Dict]) -> str:
-    lc_messages = []
-    for m in messages:
-        role = "human" if m["role"] == "user" else "assistant"
-        lc_messages.append((role, m["content"]))
-    return llm.invoke(lc_messages).content
-
-
-def on_submit(
-    user_input: str,
-    messages: List[Dict],
-    stage: str,
-    intake_state: Dict[str, Any],
-    awaiting_field: str,
-):
-    messages = messages or []
     user_input = (user_input or "").strip()
-    intake_state = intake_state or {"company_name": "", "company_background": "", "customer_name": ""}
-    awaiting_field = (awaiting_field or "").strip()
-
     if not user_input:
-        return messages, stage, intake_state, awaiting_field
+        return messages, state
 
     messages.append({"role": "user", "content": user_input})
 
-    # ---------- ROUTING (only when not already in confirm/chat) ----------
-    if stage in {"idle", "intake"}:
-        # If we asked a direct question last turn, trust the user's next reply
-        # (prevents repeated "What's your company name?" loops)
-        if stage == "intake" and awaiting_field:
-            intake_state[awaiting_field] = user_input.strip()
-            awaiting_field = ""
-        else:
-            # Detect intent only when we're not already collecting a specific field
-            try:
-                intent = detect_intent(user_input)
-            except Exception as e:
-                messages.append({"role": "assistant", "content": f"I had trouble understanding that. ({e})"})
-                return messages, stage, intake_state, awaiting_field
+    def parse_json(raw: str) -> dict:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end == -1:
+            raise ValueError("No JSON object found in model response.")
+        return json.loads(raw[start:end + 1])
 
-            # Info question: answer normally, stay idle
-            if intent == "info":
-                try:
-                    reply = llm_help_reply(user_input)
-                except Exception as e:
-                    reply = f"(error) {e}"
-                messages.append({"role": "assistant", "content": reply})
-                return messages, "idle", intake_state, awaiting_field
+    def llm_extract(expected_field: str, text: str) -> dict:
+        payload = {"expected_field": expected_field, "user_message": text}
+        raw = llm.invoke([("system", SYSTEM_EXTRACTOR), ("human", json.dumps(payload))]).content.strip()
+        return parse_json(raw)
 
-            # If they want to create an instance, start intake
-            if intent == "create_instance":
-                stage = "intake"
+    def llm_classify_industry(background: str) -> str:
+        raw = llm.invoke([("system", SYSTEM_INDUSTRY), ("human", background)]).content.strip()
+        data = parse_json(raw)
+        industry = (data.get("industry_name") or "").strip()
+        return industry
 
-            # If we're in intake, also try extracting any fields they included
-            if stage == "intake":
-                try:
-                    extracted = extract_intake(user_input)
-                    intake_state = merge_intake(intake_state, extracted)
-                except Exception as e:
-                    messages.append({"role": "assistant", "content": f"I had trouble extracting the details. ({e})"})
-                    return messages, stage, intake_state, awaiting_field
+    def is_yes(txt: str) -> bool:
+        t = txt.strip().lower()
+        return t in {"y", "yes", "yeah", "yep", "correct", "ya", "betul", "true"}
 
-        # If we are in intake mode, ask what's missing
-        if stage == "intake":
-            q, awaiting_field = next_question(intake_state)
-            if q:
-                messages.append({"role": "assistant", "content": q})
-                return messages, stage, intake_state, awaiting_field
+    def is_no(txt: str) -> bool:
+        t = txt.strip().lower()
+        return t in {"n", "no", "nope", "tak", "tidak", "bukan", "false"}
 
-            # All fields present -> confirm
-            stage = "confirm"
+    # optional reset after creation
+    if state.get("created"):
+        state.update({
+            "step": "ask_company_name",
+            "company_name": "",
+            "company_background": "",
+            "industry_name": "",
+            "industry_confirmed": False,
+            "customer_name": "",
+            "created": False,
+        })
+        messages.append({"role": "assistant", "content": "Want to create another instance? What’s your company name?"})
+        return messages, state
+
+    step = state["step"]
+
+
+    if step == "ask_company_name":
+        data = llm_extract("company_name", user_input)
+        if data["mode"] == "qa":
+            messages.append({"role": "assistant", "content": data["answer"].strip()})
+            messages.append({"role": "assistant", "content": "Now, what’s your company name?"})
+            return messages, state
+
+        name = (data.get("value") or "").strip()
+        if not name:
+            messages.append({"role": "assistant", "content": "What company name should I use? (You can give a placeholder.)"})
+            return messages, state
+
+        state["company_name"] = name
+        state["step"] = "ask_background"
+        messages.append({"role": "assistant", "content": "Nice. What does your company do (1–2 sentences)?"})
+        return messages, state
+
+
+    if step == "ask_background":
+        data = llm_extract("company_background", user_input)
+        if data["mode"] == "qa":
+            messages.append({"role": "assistant", "content": data["answer"].strip()})
+            messages.append({"role": "assistant", "content": "Back to intake: what does your company do (1–2 sentences)?"})
+            return messages, state
+
+        bg = (data.get("value") or "").strip()
+        if not bg:
+            messages.append({"role": "assistant", "content": "Could you describe what your company does in 1–2 sentences?"})
+            return messages, state
+
+        state["company_background"] = bg
+
+        # LLM #2 classification (always one of 7)
+        industry = llm_classify_industry(bg)
+
+        # hard guard in case model misbehaves
+        if industry not in INDUSTRIES:
             messages.append({
                 "role": "assistant",
-                "content": (
-                    "Got it — here’s what I’ll use:\n"
-                    f'- Company: {intake_state["company_name"]}\n'
-                    f'- Background: {intake_state["company_background"]}\n'
-                    f'- Customer name (instance for): {intake_state["customer_name"]}\n\n'
-                    "Proceed to create the simulator instance? (yes/no)"
-                )
+                "content": "I couldn’t classify reliably. Please choose one:\n" + "\n".join([f"- {x}" for x in INDUSTRIES])
             })
-            return messages, stage, intake_state, awaiting_field
+            state["step"] = "pick_industry"
+            return messages, state
 
-        # Otherwise, normal idle chat
+        state["industry_name"] = industry
+        state["industry_confirmed"] = False
+        state["step"] = "confirm_industry"
+        messages.append({"role": "assistant", "content": f"I mapped your industry to **{industry}**. Is that correct? (yes/no)"})
+        return messages, state
+
+
+    if step == "confirm_industry":
+        # allow QA without advancing
+        gate = llm_extract("industry_pick", user_input)
+        if gate["mode"] == "qa":
+            messages.append({"role": "assistant", "content": gate["answer"].strip()})
+            messages.append({"role": "assistant", "content": f"Back to intake: is **{state['industry_name']}** correct? (yes/no)"})
+            return messages, state
+
+        if is_yes(user_input):
+            state["industry_confirmed"] = True
+            state["step"] = "ask_customer_name"
+            messages.append({"role": "assistant", "content": "Great. Who should I create the simulator instance for? (customer name)"})
+            return messages, state
+
+        if is_no(user_input):
+            state["industry_name"] = ""
+            state["industry_confirmed"] = False
+            state["step"] = "pick_industry"
+            messages.append({"role": "assistant", "content": "Okay — choose one industry:\n" + "\n".join([f"- {x}" for x in INDUSTRIES])})
+            return messages, state
+
+        messages.append({"role": "assistant", "content": "Please reply **yes** or **no**."})
+        return messages, state
+
+    if step == "pick_industry":
+        data = llm_extract("industry_pick", user_input)
+        if data["mode"] == "qa":
+            messages.append({"role": "assistant", "content": data["answer"].strip()})
+            messages.append({"role": "assistant", "content": "Now, please choose one industry:\n" + "\n".join([f"- {x}" for x in INDUSTRIES])})
+            return messages, state
+
+        pick = (data.get("value") or "").strip()
+        if pick not in INDUSTRIES:
+            messages.append({"role": "assistant", "content": "Please pick exactly one:\n" + "\n".join([f"- {x}" for x in INDUSTRIES])})
+            return messages, state
+
+        state["industry_name"] = pick
+        state["industry_confirmed"] = True
+        state["step"] = "ask_customer_name"
+        messages.append({"role": "assistant", "content": f"Got it — **{pick}**. Who should I create the simulator instance for? (customer name)"})
+        return messages, state
+
+    if step == "ask_customer_name":
+        data = llm_extract("customer_name", user_input)
+        if data["mode"] == "qa":
+            messages.append({"role": "assistant", "content": data["answer"].strip()})
+            messages.append({"role": "assistant", "content": "Back to intake: what customer name should I create the simulator instance for?"})
+            return messages, state
+
+        customer = (data.get("value") or "").strip()
+        if not customer:
+            messages.append({"role": "assistant", "content": "What customer name should I create the simulator instance for?"})
+            return messages, state
+
+        if not state.get("industry_confirmed") or state.get("industry_name") not in INDUSTRIES:
+            state["step"] = "pick_industry"
+            messages.append({"role": "assistant", "content": "Before creating, choose one industry:\n" + "\n".join([f"- {x}" for x in INDUSTRIES])})
+            return messages, state
+
+        state["customer_name"] = customer
+
         try:
-            reply = llm_chat_reply(messages)
+            r = requests.post(
+                API_URL,
+                json={"customer_name": state["customer_name"], "industry_name": state["industry_name"]},
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            result = r.json()
         except Exception as e:
-            reply = f"(error) {e}"
-        messages.append({"role": "assistant", "content": reply})
-        return messages, "idle", intake_state, awaiting_field
+            messages.append({"role": "assistant", "content": f"Request failed: {e}"})
+            return messages, state
 
-    # ---------- CONFIRM ----------
-    if stage == "confirm":
-        if user_input.lower().startswith("y"):
-            try:
-                result = send_customer_name(intake_state["customer_name"])
-                if result.get("success") is True:
-                    messages.append({
-                        "role": "assistant",
-                        "content": (
-                            f"Done — simulator instance created for **{intake_state['customer_name']}** "
-                            f"(ID: {result.get('id')}). You can continue chatting."
-                        )
-                    })
-                    stage = "chat"
-                else:
-                    messages.append({"role": "assistant", "content": f"API responded with: {result}"})
-            except Exception as e:
-                messages.append({"role": "assistant", "content": f"Request failed: {e}"})
-            return messages, stage, intake_state, awaiting_field
-        else:
-            stage = "intake"
+        # user wont directly see the api status, only the processed result
+        ok = (result.get("success") is True) or (result.get("status") == "Message received successfully")
+        if ok:
             messages.append({
                 "role": "assistant",
-                "content": "No worries — just reply with the corrected company name, background, or customer name."
+                "content": f"Created simulator instance for **{state['customer_name']}** under **{state['industry_name']}**."
             })
-            return messages, stage, intake_state, awaiting_field
+            state["created"] = True
+            state["step"] = "done"
+            return messages, state
 
-    # ---------- CHAT ----------
-    if stage == "chat":
-        try:
-            reply = llm_chat_reply(messages)
-        except Exception as e:
-            reply = f"(error) {e}"
-        messages.append({"role": "assistant", "content": reply})
-        return messages, stage, intake_state, awaiting_field
+        messages.append({"role": "assistant", "content": f"API responded with: {result}"})
+        return messages, state
 
-    # fallback
-    messages.append({"role": "assistant", "content": "I got a bit lost — let’s continue."})
-    return messages, "idle", intake_state, ""
+    messages.append({"role": "assistant", "content": "Done. If you want another, type anything to restart."})
+    state["created"] = True
+    return messages, state
 
-
+#the ui part is here 
 with gr.Blocks(title="Odoo Simulator Chat") as demo:
     gr.Markdown("## Odoo Simulator Chat")
 
     chatbot = gr.Chatbot(height=420)
-    msg = gr.Textbox(
-        placeholder="Ask anything (e.g., 'what is odoo' or 'create odoo simulator instance')",
-        autofocus=True
-    )
-
-    state_stage = gr.State("idle")
-    state_intake = gr.State({"company_name": "", "company_background": "", "customer_name": ""})
-    state_awaiting = gr.State("")  # "", "company_name", "company_background", "customer_name"
+    msg = gr.Textbox(placeholder="Type here…", autofocus=True)
+    state = gr.State(None)
 
     demo.load(
         lambda: (
-            [{"role": "assistant", "content": "Hi! Ask me anything. If you want to create an Odoo simulator instance, just tell me."}],
-            "idle",
-            {"company_name": "", "company_background": "", "customer_name": ""},
-            "",
+            [{"role": "assistant", "content": "Hi! What’s your company name?"}],
+            None,
         ),
         None,
-        [chatbot, state_stage, state_intake, state_awaiting],
+        [chatbot, state],
     )
 
-    msg.submit(
-        on_submit,
-        inputs=[msg, chatbot, state_stage, state_intake, state_awaiting],
-        outputs=[chatbot, state_stage, state_intake, state_awaiting],
-    ).then(lambda: "", None, msg)
+    msg.submit(on_submit, inputs=[msg, chatbot, state], outputs=[chatbot, state]).then(lambda: "", None, msg)
 
 #demo.launch()
 demo.launch(server_name="127.0.0.1",server_port=7860)
