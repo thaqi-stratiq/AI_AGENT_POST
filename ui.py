@@ -92,10 +92,23 @@ def on_submit(user_input, messages, state):
     messages.append({"role": "user", "content": user_input})
 
     def parse_json(raw: str) -> dict:
+        raw = (raw or "").strip()
+
+        # Fast path: extract first JSON object if present
         start, end = raw.find("{"), raw.rfind("}")
-        if start == -1 or end == -1:
-            raise ValueError("No JSON object found in model response.")
-        return json.loads(raw[start:end + 1])
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(raw[start:end + 1])
+            except Exception:
+                pass
+
+        # If no JSON found, return a safe fallback dict instead of crashing
+        # This prevents Gradio worker from dying
+        return {
+            "mode": "qa",
+            "answer": f"(server) Model returned non-JSON output:\n{raw[:500]}",
+            "value": ""
+        }
 
     def llm_extract(expected_field: str, text: str) -> dict:
         payload = {"expected_field": expected_field, "user_message": text}
