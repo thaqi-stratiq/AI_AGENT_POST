@@ -2,14 +2,15 @@ import json
 import requests
 import gradio as gr
 from typing import List, Dict, Any, Tuple
+import os
 
-from langchain_ollama import ChatOllama
-
+#from langchain_ollama import ChatOllama
+from langchain_google_genai import ChatGoogleGenerativeAI
 #MODEL = "llama3.2:latest"
-MODEL = "qwen2.5:0.5b-instruct"
+#MODEL = "qwen2.5:0.5b-instruct"
+
 API_URL = "https://pzvpngd6ij.execute-api.ap-southeast-5.amazonaws.com/dev/create"
 #API_URL = "http://127.0.0.1:8000/receive"
-
 INDUSTRIES = [
     "Aerospace",
     "Education & Training",
@@ -20,7 +21,12 @@ INDUSTRIES = [
     "Urban Air Mobility (UAM)",
 ]
 
-llm = ChatOllama(model=MODEL)
+llm = ChatGoogleGenerativeAI(
+    model="gemini-3-flash-preview",
+    temperature=0,
+    google_api_key=os.getenv("GOOGLE_API_KEY"),
+    max_output_tokens=1024,
+)
 SYSTEM_EXTRACTOR = """
 You are a STRICT JSON assistant for an intake flow.
 
@@ -112,14 +118,35 @@ def on_submit(user_input, messages, state):
 
     def llm_extract(expected_field: str, text: str) -> dict:
         payload = {"expected_field": expected_field, "user_message": text}
-        raw = llm.invoke([("system", SYSTEM_EXTRACTOR), ("human", json.dumps(payload))]).content.strip()
+        msg = llm.invoke([("system", SYSTEM_EXTRACTOR), ("human", json.dumps(payload))])
+        raw = content_to_text(msg.content).strip()
         return parse_json(raw)
 
     def llm_classify_industry(background: str) -> str:
-        raw = llm.invoke([("system", SYSTEM_INDUSTRY), ("human", background)]).content.strip()
+        msg = llm.invoke([("system", SYSTEM_INDUSTRY), ("human", background)])
+        raw = content_to_text(msg.content).strip()
         data = parse_json(raw)
-        industry = (data.get("industry_name") or "").strip()
-        return industry
+        return (data.get("industry_name") or "").strip()
+    def content_to_text(content) -> str:
+        """LangChain message content can be str or list (multi-part). Normalize to str."""
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            out = []
+            for part in content:
+                # common shapes: {"type":"text","text":"..."} or plain strings
+                if isinstance(part, str):
+                    out.append(part)
+                elif isinstance(part, dict):
+                    if "text" in part and isinstance(part["text"], str):
+                        out.append(part["text"])
+                    elif "content" in part and isinstance(part["content"], str):
+                        out.append(part["content"])
+            return "\n".join(out)
+        return str(content)
+
 
     def is_yes(txt: str) -> bool:
         t = txt.strip().lower()
@@ -270,7 +297,7 @@ def on_submit(user_input, messages, state):
         except Exception as e:
             messages.append({"role": "assistant", "content": f"Request failed: {e}"})
             return messages, state
-
+        print("result:", result, flush=True)
         # user wont directly see the api status, only the processed result
         ok = (result.get("success") is True) or (result.get("status") == "Message received successfully")
         if ok:
